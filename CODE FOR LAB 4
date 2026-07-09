@@ -1,0 +1,282 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+#include <cstdio>
+
+// Sensor configuration
+#define TEMP_CONVERSION 330.0f
+#define MIN_TEMP_LIMIT 30.0f
+#define MAX_TEMP_LIMIT 80.0f
+#define GAS_DELAY_COUNT 6
+
+#define POT_RANGE 100.0f
+#define STATUS_UPDATE_TIME 500
+#define LED_FLASH_TIME 250
+#define LOOP_DELAY 10
+
+// Inputs
+AnalogIn tempSensor(A1);
+AnalogIn sensitivityControl(A0);
+
+DigitalIn gasDetector(PE_12);
+
+// Outputs
+DigitalOut alarmBuzzer(PE_10);
+DigitalOut alarmLED(LED1);
+
+// Serial communication
+UnbufferedSerial uart(USBTX, USBRX, 115200);
+
+
+// System variables
+float temperature = 0;
+float sensitivityLevel = 50;
+
+bool gasAlarm = false;
+bool tempAlarm = false;
+bool alarmState = false;
+
+int statusTimer = 0;
+int ledTimer = 0;
+int gasCounter = 0;
+
+
+// Function declarations
+void setup();
+void sensorReading();
+void checkAlarmConditions();
+void controlAlarmOutputs();
+void displaySystemStatus();
+
+float calculateThreshold(float value);
+float getTemperature();
+
+void sendMessage(const char *text);
+
+
+
+int main()
+{
+    setup();
+
+    sendMessage("\r\nSMART HOME SENSOR MONITOR\r\n");
+    sendMessage("System started successfully\r\n\r\n");
+
+
+    while(true)
+    {
+        sensorReading();
+
+        checkAlarmConditions();
+
+        controlAlarmOutputs();
+
+
+        statusTimer += LOOP_DELAY;
+
+        if(statusTimer >= STATUS_UPDATE_TIME)
+        {
+            displaySystemStatus();
+            statusTimer = 0;
+        }
+
+
+        ThisThread::sleep_for(10ms);
+    }
+}
+
+
+
+// Initialise hardware
+void setup()
+{
+    gasDetector.mode(PullDown);
+
+    alarmBuzzer = OFF;
+    alarmLED = OFF;
+
+
+    // startup indication
+    alarmLED = ON;
+    ThisThread::sleep_for(500ms);
+    alarmLED = OFF;
+
+
+    statusTimer = 0;
+    ledTimer = 0;
+    gasCounter = 0;
+}
+
+
+
+// Read all sensors
+void sensorReading()
+{
+    temperature = getTemperature();
+
+    float potValue = sensitivityControl.read();
+
+    sensitivityLevel = calculateThreshold(potValue);
+
+    gasAlarm = gasDetector.read();
+}
+
+
+
+// Check sensor conditions
+void checkAlarmConditions()
+{
+    float temperatureLimit;
+
+    temperatureLimit = MIN_TEMP_LIMIT +
+    (sensitivityLevel / POT_RANGE) *
+    (MAX_TEMP_LIMIT - MIN_TEMP_LIMIT);
+
+
+    if(temperature > temperatureLimit)
+    {
+        tempAlarm = true;
+    }
+    else
+    {
+        tempAlarm = false;
+    }
+
+
+    if(gasAlarm)
+    {
+        gasCounter++;
+
+        if(gasCounter >= GAS_DELAY_COUNT)
+        {
+            gasAlarm = true;
+        }
+    }
+    else
+    {
+        gasCounter = 0;
+        gasAlarm = false;
+    }
+
+
+    alarmState = tempAlarm || gasAlarm;
+}
+
+
+
+// Control buzzer and LED
+void controlAlarmOutputs()
+{
+    if(alarmState)
+    {
+        alarmBuzzer = ON;
+
+
+        ledTimer += LOOP_DELAY;
+
+        if(ledTimer >= LED_FLASH_TIME)
+        {
+            alarmLED = !alarmLED;
+            ledTimer = 0;
+        }
+    }
+    else
+    {
+        alarmBuzzer = OFF;
+        alarmLED = OFF;
+        ledTimer = 0;
+    }
+}
+
+
+
+// Display information on serial terminal
+void displaySystemStatus()
+{
+    char message[150];
+
+
+    sendMessage("--------------------------\r\n");
+
+
+    sprintf(message,
+    "Sensitivity: %.1f /100\r\n",
+    sensitivityLevel);
+
+    sendMessage(message);
+
+
+    sprintf(message,
+    "Temperature: %.2f C\r\n",
+    temperature);
+
+    sendMessage(message);
+
+
+
+    if(gasAlarm)
+    {
+        sendMessage("Gas Status: WARNING\r\n");
+    }
+    else
+    {
+        sendMessage("Gas Status: Normal\r\n");
+    }
+
+
+
+    if(alarmState)
+    {
+        sendMessage("BUZZER ACTIVATED\r\n");
+
+
+        if(tempAlarm && gasAlarm)
+        {
+            sendMessage("Cause: Temperature and Gas\r\n");
+        }
+        else if(tempAlarm)
+        {
+            sendMessage("Cause: Temperature\r\n");
+        }
+        else
+        {
+            sendMessage("Cause: Gas\r\n");
+        }
+
+    }
+    else
+    {
+        sendMessage("System Normal\r\n");
+        sendMessage("Buzzer OFF\r\n");
+    }
+
+
+    sendMessage("--------------------------\r\n\r\n");
+}
+
+
+
+// Convert potentiometer value into threshold
+float calculateThreshold(float value)
+{
+    return value * POT_RANGE;
+}
+
+
+
+// Convert LM35 analogue value into temperature
+float getTemperature()
+{
+    float sensorValue;
+
+    sensorValue = tempSensor.read();
+
+    return sensorValue * TEMP_CONVERSION;
+}
+
+
+
+// Send data through UART
+void sendMessage(const char *text)
+{
+    uart.write(text, strlen(text));
+}
