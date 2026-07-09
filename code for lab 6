@@ -1,0 +1,206 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+
+#define SERIAL_SPEED 115200
+#define LCD_ADDRESS (0x27 << 1)
+
+#define TEMP_LIMIT 50.0f
+#define LCD_REFRESH_TIME 500
+
+#define LCD_RS 0x01
+#define LCD_EN 0x04
+#define LCD_BACKLIGHT 0x08
+
+AnalogIn temperature(A1);
+DigitalIn gasInput(PE_12);
+
+DigitalOut buzzer(PE_10);
+DigitalOut alarmLED(LED1);
+
+I2C lcdBus(PB_9, PB_8);
+UnbufferedSerial pcSerial(USBTX, USBRX, SERIAL_SPEED);
+
+
+float temperatureValue;
+bool gasState;
+bool alarmActive;
+
+int lcdCounter = 0;
+
+
+void lcdSend(uint8_t data)
+{
+    char message = data | LCD_BACKLIGHT;
+    lcdBus.write(LCD_ADDRESS, &message, 1);
+}
+
+
+void lcdPulse(uint8_t data)
+{
+    lcdSend(data | LCD_EN);
+    ThisThread::sleep_for(2ms);
+
+    lcdSend(data);
+    ThisThread::sleep_for(2ms);
+}
+
+
+void lcdWrite(char value, bool command)
+{
+    uint8_t high = value & 0xF0;
+    uint8_t low = (value << 4) & 0xF0;
+
+    if(!command)
+    {
+        high |= LCD_RS;
+        low |= LCD_RS;
+    }
+
+    lcdPulse(high);
+    lcdPulse(low);
+}
+
+
+void lcdCommand(char command)
+{
+    lcdWrite(command,true);
+}
+
+
+void lcdPrint(char text[])
+{
+    while(*text)
+    {
+        lcdWrite(*text,false);
+        text++;
+    }
+}
+
+
+void lcdSetup()
+{
+    lcdBus.frequency(100000);
+
+    ThisThread::sleep_for(100ms);
+
+    lcdCommand(0x33);
+    lcdCommand(0x32);
+    lcdCommand(0x28);
+    lcdCommand(0x0C);
+    lcdCommand(0x06);
+    lcdCommand(0x01);
+
+    ThisThread::sleep_for(5ms);
+}
+
+
+void lcdPosition(int column,int row)
+{
+    int locations[4]={0x00,0x40,0x14,0x54};
+
+    lcdCommand(0x80 + locations[row] + column);
+}
+
+
+float readTemperature()
+{
+    return temperature.read()*330.0f;
+}
+
+
+void readSensors()
+{
+    temperatureValue = readTemperature();
+    gasState = gasInput.read();
+
+    alarmActive = false;
+
+    if(temperatureValue > TEMP_LIMIT)
+        alarmActive=true;
+
+    if(gasState)
+        alarmActive=true;
+}
+
+
+void updateAlarm()
+{
+    if(alarmActive)
+    {
+        buzzer=ON;
+        alarmLED=!alarmLED;
+    }
+    else
+    {
+        buzzer=OFF;
+        alarmLED=OFF;
+    }
+}
+
+
+void updateLCD()
+{
+    char buffer[20];
+
+
+    lcdCommand(0x01);
+
+
+    lcdPosition(0,0);
+    sprintf(buffer,"Temp %.1f C",temperatureValue);
+    lcdPrint(buffer);
+
+
+    lcdPosition(0,1);
+
+    if(gasState)
+        lcdPrint("Gas: DETECTED");
+    else
+        lcdPrint("Gas: NORMAL");
+
+
+    lcdPosition(0,2);
+
+    if(alarmActive)
+        lcdPrint("ALARM ACTIVE");
+    else
+        lcdPrint("SYSTEM NORMAL");
+
+
+    lcdPosition(0,3);
+    lcdPrint("Smart Home System");
+}
+
+
+int main()
+{
+
+    lcdSetup();
+
+    buzzer=OFF;
+    alarmLED=OFF;
+
+
+    while(true)
+    {
+
+        readSensors();
+
+        updateAlarm();
+
+
+        lcdCounter+=100;
+
+
+        if(lcdCounter>=LCD_REFRESH_TIME)
+        {
+            lcdCounter=0;
+            updateLCD();
+        }
+
+
+        ThisThread::sleep_for(100ms);
+
+    }
+
+}
