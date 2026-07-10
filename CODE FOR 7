@@ -1,0 +1,371 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+
+/*
+    Lab 7 - DC Motor Driving using Relays and Interrupts
+
+    Features:
+    - Three push buttons using interrupts
+    - PIR sensor interrupt
+    - Relay motor control
+    - Motor state machine
+    - LED gate direction indication
+    - Serial monitoring
+*/
+
+
+#define SERIAL_BAUD 115200
+#define MOTOR_DELAY_MS 2000
+
+
+// ---------------- MOTOR STATES ----------------
+
+typedef enum
+{
+    MOTOR_STOPPED,
+    MOTOR_OPENING,
+    MOTOR_CLOSING
+
+} motorState_t;
+
+
+// ---------------- HARDWARE CONNECTIONS ----------------
+
+
+// Push buttons
+InterruptIn openButton(PB_4, PullUp);
+InterruptIn closeButton(PB_10, PullUp);
+InterruptIn stopButton(PA_8, PullUp);
+
+
+// PIR sensor
+InterruptIn pirSensor(PC_13);
+
+
+// Relay module outputs
+DigitalOut relayOpen(PF_2);
+DigitalOut relayClose(PE_3);
+
+
+// LEDs
+DigitalOut greenLED(LED1);
+DigitalOut redLED(LED2);
+
+
+// Serial communication
+UnbufferedSerial uartUsb(USBTX, USBRX, SERIAL_BAUD);
+
+
+// ---------------- INTERRUPT FLAGS ----------------
+
+
+volatile bool openRequest = false;
+volatile bool closeRequest = false;
+volatile bool stopRequest = false;
+volatile bool intruderDetected = false;
+
+
+// ---------------- VARIABLES ----------------
+
+
+motorState_t motorState = MOTOR_STOPPED;
+
+Timer motorTimer;
+
+
+
+// ---------------- FUNCTION PROTOTYPES ----------------
+
+
+void serialPrint(const char *message);
+
+void openButtonISR();
+void closeButtonISR();
+void stopButtonISR();
+void pirISR();
+
+void motorStop();
+void motorOpen();
+void motorClose();
+
+void initialiseSystem();
+
+
+
+
+// ---------------- MAIN PROGRAM ----------------
+
+
+int main()
+{
+
+    initialiseSystem();
+
+
+    serialPrint("\r\n============================\r\n");
+    serialPrint(" LAB 7 DC MOTOR CONTROL\r\n");
+    serialPrint(" Interrupt Based System\r\n");
+    serialPrint("============================\r\n");
+
+
+    while(true)
+    {
+
+
+        // PIR interrupt response
+
+        if(intruderDetected)
+        {
+            intruderDetected = false;
+
+            serialPrint("PIR SENSOR: Intruder detected\r\n");
+
+            motorStop();
+        }
+
+
+
+        // Open gate request
+
+        if(openRequest)
+        {
+            openRequest = false;
+
+            serialPrint("OPEN BUTTON PRESSED\r\n");
+
+            motorOpen();
+        }
+
+
+
+        // Close gate request
+
+        if(closeRequest)
+        {
+            closeRequest = false;
+
+            serialPrint("CLOSE BUTTON PRESSED\r\n");
+
+            motorClose();
+        }
+
+
+
+        // Stop motor request
+
+        if(stopRequest)
+        {
+            stopRequest = false;
+
+            serialPrint("STOP BUTTON PRESSED\r\n");
+
+            motorStop();
+        }
+
+
+
+        ThisThread::sleep_for(10ms);
+
+    }
+
+}
+
+// ---------------- INITIALISATION ----------------
+
+
+void initialiseSystem()
+{
+
+    // Relay modules are active LOW
+    // HIGH means relay OFF
+
+    relayOpen = HIGH;
+    relayClose = HIGH;
+
+
+    // LEDs OFF
+
+    greenLED = OFF;
+    redLED = OFF;
+
+
+
+    // Configure button interrupts
+
+    openButton.fall(&openButtonISR);
+    closeButton.fall(&closeButtonISR);
+    stopButton.fall(&stopButtonISR);
+
+
+
+    // Configure PIR interrupt
+
+    pirSensor.mode(PullDown);
+    pirSensor.rise(&pirISR);
+
+
+
+    serialPrint("System Initialised\r\n");
+
+}
+
+
+
+
+// ---------------- INTERRUPT SERVICE ROUTINES ----------------
+
+
+// Open button interrupt
+
+void openButtonISR()
+{
+    openRequest = true;
+}
+
+
+
+// Close button interrupt
+
+void closeButtonISR()
+{
+    closeRequest = true;
+}
+
+
+
+// Stop button interrupt
+
+void stopButtonISR()
+{
+    stopRequest = true;
+}
+
+
+
+// PIR interrupt
+
+void pirISR()
+{
+    intruderDetected = true;
+}
+
+
+
+
+
+// ---------------- MOTOR FUNCTIONS ----------------
+
+
+
+void motorOpen()
+{
+
+    motorState = MOTOR_OPENING;
+
+
+    // Turn off opposite relay first
+
+    relayClose = HIGH;
+
+
+    ThisThread::sleep_for(50ms);
+
+
+    // Activate opening relay
+
+    relayOpen = LOW;
+
+
+
+    greenLED = ON;
+    redLED = OFF;
+
+
+
+    serialPrint("Motor State: OPENING\r\n");
+
+
+    motorTimer.reset();
+    motorTimer.start();
+
+}
+
+
+
+
+void motorClose()
+{
+
+    motorState = MOTOR_CLOSING;
+
+
+    // Turn off opposite relay first
+
+    relayOpen = HIGH;
+
+
+    ThisThread::sleep_for(50ms);
+
+
+
+    // Activate closing relay
+
+    relayClose = LOW;
+
+
+
+    greenLED = OFF;
+    redLED = ON;
+
+
+
+    serialPrint("Motor State: CLOSING\r\n");
+
+
+
+    motorTimer.reset();
+    motorTimer.start();
+
+}
+
+
+
+
+void motorStop()
+{
+
+    motorState = MOTOR_STOPPED;
+
+
+
+    // Disable both relays
+
+    relayOpen = HIGH;
+    relayClose = HIGH;
+
+
+
+    greenLED = OFF;
+    redLED = OFF;
+
+
+
+    serialPrint("Motor State: STOPPED\r\n");
+
+
+    motorTimer.stop();
+
+}
+
+
+// ---------------- SERIAL OUTPUT FUNCTION ----------------
+
+
+void serialPrint(const char *message)
+{
+
+    uartUsb.write(message, strlen(message));
+
+}
+
+
