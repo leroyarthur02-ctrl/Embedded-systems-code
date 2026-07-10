@@ -1,0 +1,1138 @@
+#include &quot;mbed.h&quot;
+#include &quot;arm_book_lib.h&quot;
+#include &quot;SDBlockDevice.h&quot;
+#include &quot;FATFileSystem.h&quot;
+#include &lt;cstring&gt;
+#include &lt;cstdio&gt;
+
+#define NUMBER_OF_KEYS 5
+#define BLINKING_TIME_GAS_ALARM 1000
+#define BLINKING_TIME_OVER_TEMP_ALARM 500
+#define BLINKING_TIME_GAS_AND_OVER_TEMP_ALARM 100
+#define NUMBER_OF_AVG_SAMPLES 100
+#define TIME_INCREMENT_MS 10
+#define DEBOUNCE_KEY_TIME_MS 40
+#define KEYPAD_NUMBER_OF_ROWS 4
+#define KEYPAD_NUMBER_OF_COLS 4
+#define EVENT_MAX_STORAGE 5
+#define EVENT_NAME_MAX_LENGTH 40
+#define SERIAL_BAUD 115200
+
+#define TEMP_THRESHOLD_MIN 25.0f
+#define TEMP_THRESHOLD_MAX 40.0f
+#define GAS_THRESHOLD_MIN 0.0f
+#define GAS_THRESHOLD_MAX 800.0f
+#define MQ2_PPM_SCALE 1000.0f
+#define LM35_SCALE 330.0f
+
+#define LCD_REGULAR_UPDATE_MS 300
+#define LCD_ALARM_STATUS_INTERVAL_MS 60000
+
+#define PCF8574_ADDR (0x27 &lt;&lt; 1)
+
+#define LCD_RS 0x01
+#define LCD_RW 0x02
+#define LCD_EN 0x04
+#define LCD_BL 0x08
+#define LCD_D4 0x10
+#define LCD_D5 0x20
+#define LCD_D6 0x40
+#define LCD_D7 0x80
+
+#define MOTOR_UPDATE_TIME 9
+#define LOG_FILE &quot;/sd/alerts.txt&quot;
+
+typedef enum {
+MATRIX_KEYPAD_SCANNING,
+MATRIX_KEYPAD_DEBOUNCE,
+MATRIX_KEYPAD_KEY_HOLD_PRESSED
+} matrixKeypadState_t;
+
+typedef enum {
+LCD_SCREEN_NORMAL,
+LCD_SCREEN_GAS_REPORT,
+LCD_SCREEN_TEMP_REPORT,
+LCD_SCREEN_ALARM_WARNING,
+LCD_SCREEN_CODE_ENTRY,
+LCD_SCREEN_MOTOR_STATUS
+} lcdScreen_t;
+
+typedef struct systemEvent {
+time_t seconds;
+char typeOfEvent[EVENT_NAME_MAX_LENGTH];
+} systemEvent_t;
+
+typedef enum {
+DIRECTION_1,
+DIRECTION_2,
+STOPPED
+} motorDirection_t;
+
+typedef enum {
+MONITOR_NONE,
+MONITOR_TEMP,
+MONITOR_GAS,
+MONITOR_BOTH
+} monitorMode_t;
+
+DigitalIn alarmTestButton(BUTTON1);
+DigitalIn mq2Digital(PE_12);
+AnalogIn mq2Analog(A2);
+AnalogIn lm35(A1);
+AnalogIn potentiometer(A0);
+
+InterruptIn pirSensor(PC_13);
+InterruptIn btnOpen (PB_4);
+InterruptIn btnClose(PB_10);
+InterruptIn btnStop (PA_8);
+
+DigitalIn keypadColPins[KEYPAD_NUMBER_OF_COLS] = {PB_12, PB_13, PB_15, PC_6};
+
+DigitalOut alarmLed(LED1);
+DigitalOut incorrectCodeLed(LED3);
+DigitalOut systemBlockedLed(LED2);
+DigitalOut buzzer(PE_10);
+
+DigitalOut greenLed(PA_6);
+DigitalOut redLed(PA_5);
+
+DigitalOut motorM1Pin(PF_2, 1);
+DigitalOut motorM2Pin(PE_3, 1);
+
+UnbufferedSerial uartUsb(USBTX, USBRX, SERIAL_BAUD);
+I2C i2c(PB_9, PB_8);
+
+DigitalOut keypadRowPins[KEYPAD_NUMBER_OF_ROWS] = {PB_3, PB_5, PC_7, PA_15};
+
+SDBlockDevice sd(PC_12, PC_11, PC_10, PA_4);
+FATFileSystem fs(&quot;sd&quot;);
+
+bool alarmState = OFF;
+bool overTempDetector = OFF;
+bool gasDetector = OFF;
+bool alarmPromptShown = false;
+
+int numberOfIncorrectCodes = 0;
+int accumulatedTimeAlarm = 0;
+int matrixKeypadCodeIndex = 0;
+
+char codeSequence[NUMBER_OF_KEYS] = { &#39;1&#39;, &#39;8&#39;, &#39;0&#39;, &#39;5&#39;, &#39;5&#39; };
+char keyPressed[NUMBER_OF_KEYS] = { &#39;0&#39;, &#39;0&#39;, &#39;0&#39;, &#39;0&#39;, &#39;0&#39; };
+
+bool gasDetectorState = OFF;
+bool overTempDetectorState = OFF;
+
+float lm35ReadingsAverage = 0.0f;
+float lm35ReadingsSum = 0.0f;
+
+float lm35ReadingsArray[NUMBER_OF_AVG_SAMPLES];
+float lm35TempC = 0.0f;
+float aqPpm = 0.0f;
+float tempThreshold = 31.0f;
+float gasThreshold = 400.0f;
+
+int accumulatedDebounceMatrixKeypadTime = 0;
+char matrixKeypadLastKeyPressed = &#39;\0&#39;;
+char matrixKeypadIndexToCharArray[] = {
+&#39;1&#39;, &#39;2&#39;, &#39;3&#39;, &#39;A&#39;,
+&#39;4&#39;, &#39;5&#39;, &#39;6&#39;, &#39;B&#39;,
+&#39;7&#39;, &#39;8&#39;, &#39;9&#39;, &#39;C&#39;,
+&#39;*&#39;, &#39;0&#39;, &#39;#&#39;, &#39;D&#39;,
+};
+matrixKeypadState_t matrixKeypadState;
+
+int eventsIndex = 0;
+systemEvent_t arrayOfStoredEvents[EVENT_MAX_STORAGE];
+
+int statusPrintCounter = 0;
+int lcdUpdateCounter = 0;
+int lcdReportCounter = 0;
+int alarmStatusCounter = 0;
+int motorScreenCounter = 0;
+
+lcdScreen_t currentLcdScreen = LCD_SCREEN_NORMAL;
+
+motorDirection_t motorDirection = STOPPED;
+motorDirection_t motorState = STOPPED;
+
+volatile bool pirFlag = false;
+
+volatile bool openFlag = false;
+volatile bool closeFlag = false;
+volatile bool stopFlag = false;
+
+monitorMode_t monitorMode = MONITOR_NONE;
+int alertCount = 0;
+bool sdMounted = false;
+
+void inputsInit();
+void outputsInit();
+void thresholdUpdate();
+void alarmActivationUpdate();
+void alarmDeactivationUpdate();
+void motorControlUpdate();
+void interruptFlagHandler();
+void printStatus();
+void printMenu();
+void sdCardInit();
+bool mountSD();
+void logAlert( const char* sensorName, float value, const char* unit );
+void readAlerts();
+void lcdUpdate();
+void lcdShowNormal();
+void lcdShowGasReport();
+void lcdShowTempReport();
+void lcdShowWarning();
+void lcdShowCodeEntry();
+void lcdShowAlarmStatus();
+void lcdShowMotorStatus();
+void displayEventLog();
+void eventLogStore( const char* description );
+
+bool areEqual();
+float analogReadingScaledWithTheLM35Formula( float analogReading );
+void lm35ReadingsArrayInit();
+void matrixKeypadInit();
+char matrixKeypadScan();
+char matrixKeypadUpdate();
+void serialPrint( const char* message );
+void floatToStr( float val, int decimals, char* buf, int bufSize );
+void lcdWriteByte( uint8_t data );
+void lcdSendNibble( uint8_t nibble, bool rs );
+void lcdSendByte( uint8_t byte, bool rs );
+void lcdCommand( uint8_t cmd );
+void lcdChar( char c );
+void lcdInit();
+void lcdSetCursor( uint8_t col, uint8_t row );
+void lcdClear();
+void lcdPrint( const char* str );
+void motorDirectionWrite( motorDirection_t direction );
+motorDirection_t motorDirectionRead();
+const char* motorStateToStr( motorDirection_t state );
+
+void onPirDetected() { pirFlag = true; }
+void onBtnOpen() { openFlag = true; }
+void onBtnClose() { closeFlag = true; }
+void onBtnStop() { stopFlag = true; }
+
+int main()
+{
+inputsInit();
+outputsInit();
+lcdInit();
+
+sdCardInit();
+
+serialPrint(&quot;\r\n========================================\r\n&quot;);
+serialPrint(&quot; SMART HOME - WEEK 8 WITH SD CARD \r\n&quot;);
+serialPrint(&quot;========================================\r\n&quot;);
+printMenu();
+
+lcdClear();
+lcdSetCursor(0, 0); lcdPrint(&quot; SMART HOME SYS &quot;);
+lcdSetCursor(0, 1); lcdPrint(&quot;A=Temp B=Gas C=Both&quot;);
+lcdSetCursor(0, 2); lcdPrint(&quot;*=Read SD #=Deact &quot;);
+lcdSetCursor(0, 3); lcdPrint(&quot;Initialising... &quot;);
+ThisThread::sleep_for(2000ms);
+lcdClear();
+
+while (true) {
+thresholdUpdate();
+alarmActivationUpdate();
+alarmDeactivationUpdate();
+interruptFlagHandler();
+motorControlUpdate();
+
+statusPrintCounter += TIME_INCREMENT_MS;
+if ( statusPrintCounter &gt;= 500 ) {
+statusPrintCounter = 0;
+printStatus();
+}
+
+lcdUpdateCounter += TIME_INCREMENT_MS;
+if ( lcdUpdateCounter &gt;= LCD_REGULAR_UPDATE_MS ) {
+lcdUpdateCounter = 0;
+
+lcdUpdate();
+}
+
+if ( currentLcdScreen == LCD_SCREEN_GAS_REPORT ||
+currentLcdScreen == LCD_SCREEN_TEMP_REPORT ) {
+lcdReportCounter += TIME_INCREMENT_MS;
+if ( lcdReportCounter &gt;= 3000 ) {
+lcdReportCounter = 0;
+currentLcdScreen = LCD_SCREEN_NORMAL;
+lcdClear();
+}
+}
+
+if ( currentLcdScreen == LCD_SCREEN_MOTOR_STATUS ) {
+motorScreenCounter += TIME_INCREMENT_MS;
+if ( motorScreenCounter &gt;= 3000 ) {
+motorScreenCounter = 0;
+currentLcdScreen = LCD_SCREEN_NORMAL;
+lcdClear();
+}
+}
+
+alarmStatusCounter += TIME_INCREMENT_MS;
+if ( alarmStatusCounter &gt;= LCD_ALARM_STATUS_INTERVAL_MS ) {
+alarmStatusCounter = 0;
+lcdShowAlarmStatus();
+ThisThread::sleep_for(2000ms);
+lcdClear();
+}
+
+delay(TIME_INCREMENT_MS);
+
+}
+}
+
+void inputsInit()
+{
+lm35ReadingsArrayInit();
+alarmTestButton.mode(PullDown);
+mq2Digital.mode(PullDown);
+matrixKeypadInit();
+pirSensor.mode(PullDown);
+pirSensor.rise( &amp;onPirDetected );
+btnOpen.mode(PullUp); btnOpen.fall( &amp;onBtnOpen );
+btnClose.mode(PullUp); btnClose.fall( &amp;onBtnClose );
+btnStop.mode(PullUp); btnStop.fall( &amp;onBtnStop );
+}
+
+void outputsInit()
+{
+alarmLed = OFF;
+incorrectCodeLed = OFF;
+systemBlockedLed = OFF;
+buzzer = OFF; // buzzer off at startup
+greenLed = OFF;
+redLed = OFF;
+motorM1Pin = 1;
+motorM2Pin = 1;
+}
+
+void printMenu()
+{
+serialPrint(&quot;Keypad: A=Temp B=Gas C=Both\r\n&quot;);
+
+serialPrint(&quot; *=Read SD log\r\n&quot;);
+serialPrint(&quot; #=Deactivate alarm / event log\r\n&quot;);
+serialPrint(&quot; 4=Gas report 5=Temp report\r\n\r\n&quot;);
+}
+
+bool mountSD()
+{
+if ( sdMounted ) return true;
+int err = fs.mount(&amp;sd);
+if ( err ) {
+serialPrint(&quot;[SD] Mount failed, attempting format...\r\n&quot;);
+err = fs.reformat(&amp;sd);
+if ( err ) {
+serialPrint(&quot;[SD] Format failed. Check SD card.\r\n&quot;);
+return false;
+}
+serialPrint(&quot;[SD] Format successful.\r\n&quot;);
+}
+sdMounted = true;
+serialPrint(&quot;[SD] Mounted successfully.\r\n&quot;);
+return true;
+}
+
+void sdCardInit()
+{
+serialPrint(&quot;Mounting SD card... &quot;);
+mountSD();
+}
+
+void logAlert( const char* sensorName, float value, const char* unit )
+{
+
+alertCount++;
+
+char valStr[12];
+floatToStr( value, 1, valStr, sizeof(valStr) );
+
+serialPrint(&quot;Alert Logged: &quot;);
+serialPrint(sensorName);
+serialPrint(&quot; = &quot;);
+serialPrint(valStr);
+serialPrint(&quot; &quot;);
+serialPrint(unit);
+serialPrint(&quot;\r\n&quot;);
+
+if ( !mountSD() ) return;
+
+FILE* f = fopen( LOG_FILE, &quot;a&quot; );
+if ( f ) {
+char line[128];
+snprintf( line, sizeof(line),
+&quot;Alert #%d | Sensor: %s | Value: %s %s | State: ACTIVE\r\n&quot;,
+alertCount, sensorName, valStr, unit );
+fwrite( line, 1, strlen(line), f );
+fclose(f);
+} else {
+serialPrint(&quot;[SD] Failed to open alerts.txt\r\n&quot;);
+}
+
+lcdClear();
+lcdSetCursor(0, 0); lcdPrint(&quot;Alert Logged to SD &quot;);
+char line[21];
+snprintf( line, sizeof(line), &quot;%-20s&quot;, sensorName );
+
+lcdSetCursor(0, 1); lcdPrint(line);
+snprintf( line, sizeof(line), &quot;Val: %s %s &quot;, valStr, unit );
+lcdSetCursor(0, 2); lcdPrint(line);
+snprintf( line, sizeof(line), &quot;Alert #%d &quot;, alertCount );
+lcdSetCursor(0, 3); lcdPrint(line);
+ThisThread::sleep_for(2000ms);
+lcdClear();
+}
+
+void readAlerts()
+{
+if ( !mountSD() ) return;
+
+FILE* f = fopen( LOG_FILE, &quot;r&quot; );
+if ( !f ) {
+serialPrint(&quot;[SD] No alert log found yet.\r\n&quot;);
+return;
+}
+
+serialPrint(&quot;\r\n========== Alert Log ==========\r\n&quot;);
+char line[128];
+int lineNum = 0;
+while ( fgets( line, sizeof(line), f ) ) {
+uartUsb.write( line, strlen(line) );
+lineNum++;
+}
+fclose(f);
+
+if ( lineNum == 0 ) serialPrint(&quot;(Log file is empty)\r\n&quot;);
+serialPrint(&quot;================================\r\n\r\n&quot;);
+}
+
+void interruptFlagHandler()
+{
+if ( pirFlag ) {
+pirFlag = false;
+serialPrint(&quot;PIR: Intruder detected\r\n&quot;);
+eventLogStore(&quot;PIR_INTRUDER&quot;);
+alarmState = ON;
+if ( !alarmPromptShown ) {
+serialPrint(&quot;\r\n&gt;&gt;&gt; INTRUDER DETECTED &lt;&lt;&lt;\r\n&quot;);
+serialPrint(&quot;Enter 5-Digit Code to Deactivate\r\n\r\n&quot;);
+alarmPromptShown = true;
+currentLcdScreen = LCD_SCREEN_ALARM_WARNING;
+lcdClear();
+}
+}
+
+if ( openFlag ) {
+openFlag = false; closeFlag = false; stopFlag = false;
+motorDirectionWrite( DIRECTION_1 );
+greenLed = ON; redLed = OFF;
+serialPrint(&quot;BTN: Open gate\r\n&quot;);
+eventLogStore(&quot;BTN_OPEN_GATE&quot;);
+currentLcdScreen = LCD_SCREEN_MOTOR_STATUS;
+motorScreenCounter = 0; lcdClear();
+}
+
+if ( closeFlag ) {
+closeFlag = false; openFlag = false; stopFlag = false;
+motorDirectionWrite( DIRECTION_2 );
+greenLed = OFF; redLed = ON;
+
+serialPrint(&quot;BTN: Close gate\r\n&quot;);
+eventLogStore(&quot;BTN_CLOSE_GATE&quot;);
+currentLcdScreen = LCD_SCREEN_MOTOR_STATUS;
+motorScreenCounter = 0; lcdClear();
+}
+
+if ( stopFlag ) {
+stopFlag = false; openFlag = false; closeFlag = false;
+motorDirectionWrite( STOPPED );
+greenLed = OFF; redLed = OFF;
+serialPrint(&quot;BTN: Stop motor\r\n&quot;);
+eventLogStore(&quot;BTN_STOP_MOTOR&quot;);
+currentLcdScreen = LCD_SCREEN_MOTOR_STATUS;
+motorScreenCounter = 0; lcdClear();
+}
+}
+
+void motorControlUpdate()
+{
+static int motorUpdateCounter = 0;
+motorUpdateCounter++;
+
+if ( motorUpdateCounter &gt; MOTOR_UPDATE_TIME ) {
+motorUpdateCounter = 0;
+
+switch ( motorState ) {
+case DIRECTION_1:
+if ( motorDirection == DIRECTION_2 || motorDirection == STOPPED ) {
+motorM1Pin = 1; motorM2Pin = 1;
+ThisThread::sleep_for(50ms);
+motorState = STOPPED;
+
+}
+break;
+case DIRECTION_2:
+if ( motorDirection == DIRECTION_1 || motorDirection == STOPPED ) {
+motorM1Pin = 1; motorM2Pin = 1;
+ThisThread::sleep_for(50ms);
+motorState = STOPPED;
+}
+break;
+case STOPPED:
+default:
+if ( motorDirection == DIRECTION_1 ) {
+motorM2Pin = 1; motorM1Pin = 0; motorState = DIRECTION_1;
+}
+if ( motorDirection == DIRECTION_2 ) {
+motorM1Pin = 1; motorM2Pin = 0; motorState = DIRECTION_2;
+}
+break;
+}
+}
+}
+
+void floatToStr( float val, int decimals, char* buf, int bufSize )
+{
+int intPart = (int)val;
+float frac = val - (float)intPart;
+if ( frac &lt; 0.0f ) frac = -frac;
+
+int fracPart = 0;
+if ( decimals == 1 ) fracPart = (int)( frac * 10.0f + 0.5f );
+if ( decimals == 2 ) fracPart = (int)( frac * 100.0f + 0.5f );
+
+if ( decimals == 0 ) snprintf( buf, bufSize, &quot;%d&quot;, intPart );
+else if ( decimals == 1 ) snprintf( buf, bufSize, &quot;%d.%01d&quot;, intPart, fracPart );
+else snprintf( buf, bufSize, &quot;%d.%02d&quot;, intPart, fracPart );
+}
+
+void lcdWriteByte( uint8_t data )
+{
+char buf[1];
+buf[0] = data | LCD_BL;
+i2c.write( PCF8574_ADDR, buf, 1 );
+}
+
+void lcdSendNibble( uint8_t nibble, bool rs )
+{
+uint8_t data = 0;
+if ( nibble &amp; 0x01 ) data |= LCD_D4;
+if ( nibble &amp; 0x02 ) data |= LCD_D5;
+if ( nibble &amp; 0x04 ) data |= LCD_D6;
+if ( nibble &amp; 0x08 ) data |= LCD_D7;
+if ( rs ) data |= LCD_RS;
+lcdWriteByte( data | LCD_EN );
+ThisThread::sleep_for(2ms);
+lcdWriteByte( data );
+ThisThread::sleep_for(2ms);
+}
+
+void lcdSendByte( uint8_t byte, bool rs )
+{
+lcdSendNibble( byte &gt;&gt; 4, rs );
+lcdSendNibble( byte &amp; 0x0F, rs );
+
+}
+
+void lcdCommand( uint8_t cmd ) { lcdSendByte( cmd, false ); }
+void lcdChar( char c ) { lcdSendByte( (uint8_t)c, true ); }
+
+void lcdInit()
+{
+i2c.frequency(100000);
+ThisThread::sleep_for(100ms);
+lcdSendNibble( 0x03, false ); ThisThread::sleep_for(5ms);
+lcdSendNibble( 0x03, false ); ThisThread::sleep_for(1ms);
+lcdSendNibble( 0x03, false ); ThisThread::sleep_for(1ms);
+lcdSendNibble( 0x02, false ); ThisThread::sleep_for(1ms);
+lcdCommand( 0x28 );
+lcdCommand( 0x0C );
+lcdCommand( 0x06 );
+lcdCommand( 0x01 );
+ThisThread::sleep_for(2ms);
+}
+
+void lcdSetCursor( uint8_t col, uint8_t row )
+{
+static const uint8_t rowOffsets[] = { 0x00, 0x40, 0x14, 0x54 };
+lcdCommand( 0x80 | ( col + rowOffsets[row] ) );
+}
+
+void lcdClear() { lcdCommand( 0x01 ); ThisThread::sleep_for(2ms); }
+void lcdPrint( const char* str ) { while ( *str ) lcdChar( *str++ ); }
+
+void thresholdUpdate()
+{
+
+static float lastTempThreshold = -1.0f;
+static float lastGasThreshold = -1.0f;
+static int tickCount = 0;
+
+tickCount++;
+if ( tickCount &lt; 100 ) return;
+tickCount = 0;
+
+float pot = potentiometer.read();
+float newTemp = TEMP_THRESHOLD_MIN + pot * ( TEMP_THRESHOLD_MAX -
+TEMP_THRESHOLD_MIN );
+float newGas = GAS_THRESHOLD_MIN + pot * ( GAS_THRESHOLD_MAX - GAS_THRESHOLD_MIN
+);
+
+bool tempChanged = ( newTemp - lastTempThreshold &gt; 0.5f ) || ( newTemp - lastTempThreshold
+&lt; -0.5f );
+bool gasChanged = ( newGas - lastGasThreshold &gt; 2.0f ) || ( newGas - lastGasThreshold &lt; -2.0f
+);
+
+if ( tempChanged || gasChanged ) {
+tempThreshold = newTemp;
+gasThreshold = newGas;
+lastTempThreshold = newTemp;
+lastGasThreshold = newGas;
+
+char tStr[8], gStr[8];
+floatToStr( tempThreshold, 1, tStr, sizeof(tStr) );
+floatToStr( gasThreshold, 0, gStr, sizeof(gStr) );
+serialPrint(&quot;Thresholds -&gt; Temp: &quot;); serialPrint(tStr);
+serialPrint(&quot; C | AQ: &quot;); serialPrint(gStr);
+serialPrint(&quot; ppm\r\n&quot;);
+}
+
+}
+
+void alarmActivationUpdate()
+{
+static int lm35SampleIndex = 0;
+static bool tempWasLogged = false;
+static bool gasWasLogged = false;
+
+lm35ReadingsArray[lm35SampleIndex] = lm35.read();
+lm35SampleIndex++;
+if ( lm35SampleIndex &gt;= NUMBER_OF_AVG_SAMPLES ) lm35SampleIndex = 0;
+
+lm35ReadingsSum = 0.0f;
+for ( int i = 0; i &lt; NUMBER_OF_AVG_SAMPLES; i++ ) lm35ReadingsSum += lm35ReadingsArray[i];
+lm35ReadingsAverage = lm35ReadingsSum / NUMBER_OF_AVG_SAMPLES;
+lm35TempC = analogReadingScaledWithTheLM35Formula( lm35ReadingsAverage );
+aqPpm = mq2Analog.read() * MQ2_PPM_SCALE;
+
+bool gasRaw = mq2Digital.read();
+overTempDetector = ( lm35TempC &gt; tempThreshold );
+gasDetector = ( gasRaw || aqPpm &gt; gasThreshold );
+
+bool newAlarm = alarmState;
+
+if ( overTempDetector ) {
+overTempDetectorState = ON;
+newAlarm = true;
+if ( !tempWasLogged &amp;&amp;
+( monitorMode == MONITOR_TEMP || monitorMode == MONITOR_BOTH ) ) {
+logAlert(&quot;Temp&quot;, lm35TempC, &quot;C&quot;);
+tempWasLogged = true;
+
+}
+} else {
+tempWasLogged = false;
+}
+
+if ( gasDetector ) {
+gasDetectorState = ON;
+newAlarm = true;
+if ( !gasWasLogged &amp;&amp;
+( monitorMode == MONITOR_GAS || monitorMode == MONITOR_BOTH ) ) {
+logAlert(&quot;Gas&quot;, aqPpm, &quot;ppm&quot;);
+gasWasLogged = true;
+}
+} else {
+gasWasLogged = false;
+}
+
+if ( alarmTestButton ) {
+overTempDetectorState = ON;
+gasDetectorState = ON;
+newAlarm = true;
+}
+
+if ( newAlarm &amp;&amp; !alarmState ) {
+char tStr[8], gStr[8];
+floatToStr( lm35TempC, 1, tStr, sizeof(tStr) );
+floatToStr( aqPpm, 0, gStr, sizeof(gStr) );
+char eventStr[EVENT_NAME_MAX_LENGTH];
+snprintf( eventStr, sizeof(eventStr), &quot;ALARM T=%sC AQ=%sppm&quot;, tStr, gStr );
+eventLogStore( eventStr );
+}
+
+alarmState = newAlarm;
+
+if ( alarmState ) {
+if ( !alarmPromptShown ) {
+serialPrint(&quot;\r\n&gt;&gt;&gt; ALARM TRIGGERED &lt;&lt;&lt;\r\n&quot;);
+serialPrint(&quot;Enter 5-Digit Code to Deactivate\r\n\r\n&quot;);
+alarmPromptShown = true;
+currentLcdScreen = LCD_SCREEN_ALARM_WARNING;
+lcdClear();
+}
+
+accumulatedTimeAlarm += TIME_INCREMENT_MS;
+buzzer = ON; // buzzer ON when alarm active
+
+int blinkTime = BLINKING_TIME_GAS_ALARM;
+if ( gasDetectorState &amp;&amp; overTempDetectorState ) blinkTime =
+BLINKING_TIME_GAS_AND_OVER_TEMP_ALARM;
+else if ( overTempDetectorState ) blinkTime = BLINKING_TIME_OVER_TEMP_ALARM;
+
+if ( accumulatedTimeAlarm &gt;= blinkTime ) {
+accumulatedTimeAlarm = 0;
+alarmLed = !alarmLed;
+}
+
+} else {
+buzzer = OFF; // buzzer OFF when alarm clears
+alarmLed = OFF;
+gasDetectorState = OFF;
+overTempDetectorState = OFF;
+alarmPromptShown = false;
+
+if ( currentLcdScreen == LCD_SCREEN_ALARM_WARNING ||
+currentLcdScreen == LCD_SCREEN_CODE_ENTRY ) {
+currentLcdScreen = LCD_SCREEN_NORMAL;
+lcdClear();
+}
+}
+}
+
+void alarmDeactivationUpdate()
+{
+if ( numberOfIncorrectCodes &gt;= 5 ) { systemBlockedLed = ON; return; }
+
+char keyReleased = matrixKeypadUpdate();
+if ( keyReleased == &#39;\0&#39; ) return;
+
+if ( keyReleased == &#39;A&#39; ) {
+monitorMode = MONITOR_TEMP;
+alertCount = 0;
+serialPrint(&quot;[MODE] Temperature monitoring active. Threshold: &gt;25.0 C\r\n&quot;);
+lcdClear();
+lcdSetCursor(0, 0); lcdPrint(&quot;Mode: TEMP Monitor &quot;);
+lcdSetCursor(0, 1); lcdPrint(&quot;Logging temp alerts &quot;);
+lcdSetCursor(0, 2); lcdPrint(&quot;to SD card &quot;);
+lcdSetCursor(0, 3); lcdPrint(&quot;*=Read log &quot;);
+ThisThread::sleep_for(2000ms); lcdClear();
+return;
+}
+
+if ( keyReleased == &#39;B&#39; ) {
+monitorMode = MONITOR_GAS;
+
+alertCount = 0;
+serialPrint(&quot;[MODE] Gas monitoring active. Threshold: &gt;300 ppm\r\n&quot;);
+lcdClear();
+lcdSetCursor(0, 0); lcdPrint(&quot;Mode: GAS Monitor &quot;);
+lcdSetCursor(0, 1); lcdPrint(&quot;Logging gas alerts &quot;);
+lcdSetCursor(0, 2); lcdPrint(&quot;to SD card &quot;);
+lcdSetCursor(0, 3); lcdPrint(&quot;*=Read log &quot;);
+ThisThread::sleep_for(2000ms); lcdClear();
+return;
+}
+
+if ( keyReleased == &#39;C&#39; ) {
+monitorMode = MONITOR_BOTH;
+alertCount = 0;
+serialPrint(&quot;[MODE] Both sensors monitoring active.\r\n&quot;);
+lcdClear();
+lcdSetCursor(0, 0); lcdPrint(&quot;Mode: BOTH Monitor &quot;);
+lcdSetCursor(0, 1); lcdPrint(&quot;Logging all alerts &quot;);
+lcdSetCursor(0, 2); lcdPrint(&quot;to SD card &quot;);
+lcdSetCursor(0, 3); lcdPrint(&quot;*=Read log &quot;);
+ThisThread::sleep_for(2000ms); lcdClear();
+return;
+}
+
+if ( keyReleased == &#39;*&#39; ) {
+readAlerts();
+return;
+}
+
+if ( keyReleased == &#39;4&#39; &amp;&amp; !alarmState ) {
+currentLcdScreen = LCD_SCREEN_GAS_REPORT;
+
+lcdReportCounter = 0; lcdClear();
+return;
+}
+
+if ( keyReleased == &#39;5&#39; &amp;&amp; !alarmState ) {
+currentLcdScreen = LCD_SCREEN_TEMP_REPORT;
+lcdReportCounter = 0; lcdClear();
+return;
+}
+
+if ( keyReleased == &#39;#&#39; ) {
+if ( alarmState ) {
+if ( areEqual() ) {
+alarmState = OFF;
+numberOfIncorrectCodes = 0;
+incorrectCodeLed = OFF;
+matrixKeypadCodeIndex = 0;
+buzzer = OFF; // buzzer OFF when deactivated
+alarmLed = OFF;
+gasDetectorState = OFF;
+overTempDetectorState = OFF;
+alarmPromptShown = false;
+currentLcdScreen = LCD_SCREEN_NORMAL;
+
+serialPrint(&quot;Code correct. Alarm deactivated.\r\n\r\n&quot;);
+lcdClear();
+lcdSetCursor(0, 0); lcdPrint(&quot; ALARM DEACTIVATED &quot;);
+lcdSetCursor(0, 1); lcdPrint(&quot; System Normal &quot;);
+ThisThread::sleep_for(2000ms); lcdClear();
+
+if ( lm35TempC &gt; tempThreshold ) serialPrint(&quot;WARNING: Temp still above
+threshold!\r\n&quot;);
+if ( aqPpm &gt; gasThreshold || mq2Digital ) serialPrint(&quot;WARNING: Gas still above
+threshold!\r\n&quot;);
+
+} else {
+incorrectCodeLed = ON;
+numberOfIncorrectCodes++;
+matrixKeypadCodeIndex = 0;
+serialPrint(&quot;Incorrect code (&quot;);
+char buf[4]; snprintf( buf, sizeof(buf), &quot;%d&quot;, numberOfIncorrectCodes );
+serialPrint(buf); serialPrint(&quot; of 5 attempts).\r\n\r\n&quot;);
+}
+} else {
+displayEventLog();
+}
+
+} else {
+serialPrint(&quot;Digit [&quot;);
+char buf[4]; snprintf( buf, sizeof(buf), &quot;%d&quot;, matrixKeypadCodeIndex + 1 );
+serialPrint(buf); serialPrint(&quot;/5] entered: &quot;);
+char key[2] = { keyReleased, &#39;\0&#39; }; serialPrint(key); serialPrint(&quot;\r\n&quot;);
+
+keyPressed[matrixKeypadCodeIndex] = keyReleased;
+matrixKeypadCodeIndex++;
+currentLcdScreen = LCD_SCREEN_CODE_ENTRY;
+
+if ( matrixKeypadCodeIndex &gt;= NUMBER_OF_KEYS ) {
+serialPrint(&quot;5 digits entered - press # to confirm\r\n&quot;);
+}
+}
+}
+
+void lcdUpdate()
+{
+switch ( currentLcdScreen ) {
+case LCD_SCREEN_NORMAL: lcdShowNormal(); break;
+case LCD_SCREEN_GAS_REPORT: lcdShowGasReport(); break;
+case LCD_SCREEN_TEMP_REPORT: lcdShowTempReport(); break;
+case LCD_SCREEN_ALARM_WARNING: lcdShowWarning(); break;
+case LCD_SCREEN_CODE_ENTRY: lcdShowCodeEntry(); break;
+case LCD_SCREEN_MOTOR_STATUS: lcdShowMotorStatus(); break;
+default: lcdShowNormal(); break;
+}
+}
+
+void lcdShowNormal()
+{
+char tStr[8], ttStr[8], gStr[8];
+floatToStr( lm35TempC, 1, tStr, sizeof(tStr) );
+floatToStr( tempThreshold,0, ttStr, sizeof(ttStr) );
+floatToStr( aqPpm, 0, gStr, sizeof(gStr) );
+char line[21];
+
+lcdSetCursor(0, 0);
+snprintf( line, sizeof(line), &quot;Temp:%sC T:%sC &quot;, tStr, ttStr );
+lcdPrint(line);
+
+lcdSetCursor(0, 1);
+snprintf( line, sizeof(line), &quot;Gas:%-6s %sppm &quot;,
+gasDetector ? &quot;DETECT&quot; : &quot;Normal&quot;, gStr );
+lcdPrint(line);
+
+lcdSetCursor(0, 2);
+lcdPrint( alarmState ? &quot;*** ALARM ACTIVE ***&quot; : &quot;Status: Normal &quot; );
+
+lcdSetCursor(0, 3);
+const char* modeStr = &quot;None &quot;;
+if ( monitorMode == MONITOR_TEMP ) modeStr = &quot;Temp &quot;;
+if ( monitorMode == MONITOR_GAS ) modeStr = &quot;Gas &quot;;
+if ( monitorMode == MONITOR_BOTH ) modeStr = &quot;Both &quot;;
+snprintf( line, sizeof(line), &quot;Log:%-5s Alrts:#%d &quot;, modeStr, alertCount );
+lcdPrint(line);
+}
+
+void lcdShowMotorStatus()
+{
+char line[21];
+lcdSetCursor(0, 0); lcdPrint(&quot;-- GATE STATUS -- &quot;);
+lcdSetCursor(0, 1);
+snprintf( line, sizeof(line), &quot;State: %-13s&quot;, motorStateToStr(motorState) );
+lcdPrint(line);
+lcdSetCursor(0, 2);
+snprintf( line, sizeof(line), &quot;Green:%-3s Red:%-3s &quot;,
+greenLed ? &quot;ON &quot; : &quot;OFF&quot;, redLed ? &quot;ON &quot; : &quot;OFF&quot; );
+lcdPrint(line);
+lcdSetCursor(0, 3); lcdPrint(&quot;Open=D5 Close=D6 &quot;);
+}
+
+void lcdShowGasReport()
+{
+char gStr[8], gtStr[8];
+floatToStr( aqPpm, 0, gStr, sizeof(gStr) );
+floatToStr( gasThreshold, 0, gtStr, sizeof(gtStr) );
+
+char line[21];
+
+lcdSetCursor(0, 0); lcdPrint(&quot;-- GAS DETECTOR -- &quot;);
+lcdSetCursor(0, 1);
+snprintf( line, sizeof(line), &quot;State: %-13s&quot;, gasDetector ? &quot;DETECTED&quot; : &quot;Normal&quot; );
+lcdPrint(line);
+lcdSetCursor(0, 2);
+snprintf( line, sizeof(line), &quot;AQ: %s ppm &quot;, gStr ); lcdPrint(line);
+lcdSetCursor(0, 3);
+snprintf( line, sizeof(line), &quot;Thresh:%s ppm &quot;, gtStr ); lcdPrint(line);
+}
+
+void lcdShowTempReport()
+{
+char tStr[8], ttStr[8];
+floatToStr( lm35TempC, 2, tStr, sizeof(tStr) );
+floatToStr( tempThreshold,1, ttStr, sizeof(ttStr) );
+char line[21];
+
+lcdSetCursor(0, 0); lcdPrint(&quot;-- TEMPERATURE -- &quot;);
+lcdSetCursor(0, 1);
+snprintf( line, sizeof(line), &quot;Temp: %s C &quot;, tStr ); lcdPrint(line);
+lcdSetCursor(0, 2);
+snprintf( line, sizeof(line), &quot;Thresh: %s C &quot;, ttStr ); lcdPrint(line);
+lcdSetCursor(0, 3);
+lcdPrint( overTempDetector ? &quot;State: EXCEEDED &quot; : &quot;State: Normal &quot; );
+}
+
+void lcdShowWarning()
+{
+char tStr[8], gStr[8];
+
+floatToStr( lm35TempC, 1, tStr, sizeof(tStr) );
+floatToStr( aqPpm, 0, gStr, sizeof(gStr) );
+char line[21];
+
+lcdSetCursor(0, 0); lcdPrint(&quot;*** WARNING *** &quot;);
+lcdSetCursor(0, 1);
+if ( gasDetectorState &amp;&amp; overTempDetectorState ) {
+lcdPrint(&quot;Temp + Gas Exceeded &quot;);
+} else if ( overTempDetectorState ) {
+snprintf( line, sizeof(line), &quot;Temp:%sC EXCEEDED &quot;, tStr ); lcdPrint(line);
+} else if ( gasDetectorState ) {
+snprintf( line, sizeof(line), &quot;Gas:%sppm EXCEEDED &quot;, gStr ); lcdPrint(line);
+} else {
+lcdPrint(&quot;Intruder Detected &quot;);
+}
+lcdSetCursor(0, 2); lcdPrint(&quot;Enter Code to &quot;);
+lcdSetCursor(0, 3); lcdPrint(&quot;Deactivate Alarm &quot;);
+}
+
+void lcdShowCodeEntry()
+{
+char codeLine[21] = &quot;Code: &quot;;
+for ( int i = 0; i &lt; matrixKeypadCodeIndex; i++ ) {
+codeLine[6 + i] = keyPressed[i];
+codeLine[7 + i] = &#39;\0&#39;;
+}
+char digitLine[21];
+snprintf( digitLine, sizeof(digitLine), &quot;Digit %d of 5 &quot;, matrixKeypadCodeIndex );
+
+lcdSetCursor(0, 0); lcdPrint(&quot;Enter 5-Digit Code &quot;);
+lcdSetCursor(0, 1); lcdPrint(&quot;Then Press # &quot;);
+
+lcdSetCursor(0, 2); lcdPrint(codeLine);
+lcdSetCursor(0, 3); lcdPrint(digitLine);
+}
+
+void lcdShowAlarmStatus()
+{
+char tStr[8], gStr[8];
+floatToStr( lm35TempC, 1, tStr, sizeof(tStr) );
+floatToStr( aqPpm, 0, gStr, sizeof(gStr) );
+char line[21];
+
+lcdClear();
+lcdSetCursor(0, 0); lcdPrint(&quot;-- ALARM STATUS -- &quot;);
+lcdSetCursor(0, 1); lcdPrint( alarmState ? &quot;Alarm: ACTIVE &quot; : &quot;Alarm: Normal &quot; );
+lcdSetCursor(0, 2);
+snprintf( line, sizeof(line), &quot;Temp: %sC &quot;, tStr ); lcdPrint(line);
+lcdSetCursor(0, 3);
+snprintf( line, sizeof(line), &quot;Gas: %s ppm &quot;, gStr ); lcdPrint(line);
+}
+
+void printStatus()
+{
+char tStr[8], ttStr[8], gStr[8], gtStr[8];
+floatToStr( lm35TempC, 2, tStr, sizeof(tStr) );
+floatToStr( tempThreshold,1, ttStr, sizeof(ttStr) );
+floatToStr( aqPpm, 0, gStr, sizeof(gStr) );
+floatToStr( gasThreshold, 0, gtStr, sizeof(gtStr) );
+
+serialPrint(&quot;----------------------------------------\r\n&quot;);
+serialPrint(&quot;Temp Threshold : &quot;); serialPrint(ttStr); serialPrint(&quot; C\r\n&quot;);
+serialPrint(&quot;AQ Threshold : &quot;); serialPrint(gtStr); serialPrint(&quot; ppm\r\n&quot;);
+
+serialPrint(&quot;Temperature : &quot;); serialPrint(tStr); serialPrint(&quot; C\r\n&quot;);
+serialPrint(&quot;AQ Reading : &quot;); serialPrint(gStr); serialPrint(&quot; ppm\r\n&quot;);
+serialPrint(&quot;Gas Sensor : &quot;); serialPrint( gasDetector ? &quot;DETECTED&quot; : &quot;Normal&quot; );
+serialPrint(&quot;\r\n&quot;);
+serialPrint(&quot;Gate State : &quot;); serialPrint( motorStateToStr(motorState) ); serialPrint(&quot;\r\n&quot;);
+serialPrint(&quot;Monitor Mode : &quot;);
+if ( monitorMode == MONITOR_TEMP ) serialPrint(&quot;Temperature\r\n&quot;);
+else if ( monitorMode == MONITOR_GAS ) serialPrint(&quot;Gas\r\n&quot;);
+else if ( monitorMode == MONITOR_BOTH ) serialPrint(&quot;Both\r\n&quot;);
+else serialPrint(&quot;None\r\n&quot;);
+serialPrint(&quot;SD Card : &quot;); serialPrint( sdMounted ? &quot;OK&quot; : &quot;Not mounted&quot; ); serialPrint(&quot;\r\n&quot;);
+serialPrint(&quot;Alert Count : &quot;);
+char ac[8]; snprintf( ac, sizeof(ac), &quot;%d&quot;, alertCount );
+serialPrint(ac); serialPrint(&quot;\r\n&quot;);
+
+if ( alarmState ) {
+serialPrint(&quot;&gt;&gt;&gt; ALARM ACTIVE &lt;&lt;&lt;\r\n&quot;);
+serialPrint(&quot;Enter 5-Digit Code to Deactivate\r\n&quot;);
+serialPrint(&quot;Code so far : &quot;);
+for ( int i = 0; i &lt; matrixKeypadCodeIndex; i++ ) {
+char ch[2] = { keyPressed[i], &#39;\0&#39; }; serialPrint(ch);
+}
+serialPrint(&quot;\r\n&quot;);
+} else {
+serialPrint(&quot;Status : System Normal\r\n&quot;);
+serialPrint(&quot;A=Temp B=Gas C=Both *=Read SD #=Log\r\n&quot;);
+}
+serialPrint(&quot;----------------------------------------\r\n\r\n&quot;);
+}
+
+void displayEventLog()
+
+{
+serialPrint(&quot;\r\n===== EVENT LOG (Last 5) =====\r\n&quot;);
+bool anyEvents = false;
+for ( int i = 0; i &lt; EVENT_MAX_STORAGE; i++ ) {
+if ( arrayOfStoredEvents[i].seconds != 0 ) {
+anyEvents = true;
+char buf[4]; snprintf( buf, sizeof(buf), &quot;%d&quot;, i + 1 );
+serialPrint(buf); serialPrint(&quot;: &quot;);
+serialPrint( arrayOfStoredEvents[i].typeOfEvent ); serialPrint(&quot;\r\n&quot;);
+serialPrint(&quot; Time: &quot;);
+serialPrint( ctime(&amp;arrayOfStoredEvents[i].seconds) ); serialPrint(&quot;\r\n&quot;);
+}
+}
+if ( !anyEvents ) serialPrint(&quot;No events stored.\r\n&quot;);
+serialPrint(&quot;==============================\r\n\r\n&quot;);
+}
+
+void eventLogStore( const char* description )
+{
+arrayOfStoredEvents[eventsIndex].seconds = time(NULL);
+strncpy( arrayOfStoredEvents[eventsIndex].typeOfEvent, description,
+EVENT_NAME_MAX_LENGTH - 1 );
+arrayOfStoredEvents[eventsIndex].typeOfEvent[EVENT_NAME_MAX_LENGTH - 1] = &#39;\0&#39;;
+eventsIndex = ( eventsIndex + 1 ) % EVENT_MAX_STORAGE;
+}
+
+bool areEqual()
+{
+for ( int i = 0; i &lt; NUMBER_OF_KEYS; i++ ) {
+if ( codeSequence[i] != keyPressed[i] ) return false;
+}
+
+return true;
+}
+
+float analogReadingScaledWithTheLM35Formula( float analogReading )
+{
+return ( analogReading * LM35_SCALE );
+}
+
+void lm35ReadingsArrayInit()
+{
+for ( int i = 0; i &lt; NUMBER_OF_AVG_SAMPLES; i++ ) lm35ReadingsArray[i] = 0.0f;
+}
+
+void matrixKeypadInit()
+{
+matrixKeypadState = MATRIX_KEYPAD_SCANNING;
+for ( int i = 0; i &lt; KEYPAD_NUMBER_OF_COLS; i++ ) keypadColPins[i].mode(PullUp);
+}
+
+char matrixKeypadScan()
+{
+for ( int row = 0; row &lt; KEYPAD_NUMBER_OF_ROWS; row++ ) {
+for ( int i = 0; i &lt; KEYPAD_NUMBER_OF_ROWS; i++ ) keypadRowPins[i] = ON;
+keypadRowPins[row] = OFF;
+for ( int col = 0; col &lt; KEYPAD_NUMBER_OF_COLS; col++ ) {
+if ( keypadColPins[col] == OFF ) {
+return matrixKeypadIndexToCharArray[row * KEYPAD_NUMBER_OF_COLS + col];
+}
+}
+}
+return &#39;\0&#39;;
+
+}
+
+char matrixKeypadUpdate()
+{
+char keyDetected = &#39;\0&#39;;
+char keyReleased = &#39;\0&#39;;
+
+switch ( matrixKeypadState ) {
+case MATRIX_KEYPAD_SCANNING:
+keyDetected = matrixKeypadScan();
+if ( keyDetected != &#39;\0&#39; ) {
+matrixKeypadLastKeyPressed = keyDetected;
+accumulatedDebounceMatrixKeypadTime = 0;
+matrixKeypadState = MATRIX_KEYPAD_DEBOUNCE;
+}
+break;
+case MATRIX_KEYPAD_DEBOUNCE:
+if ( accumulatedDebounceMatrixKeypadTime &gt;= DEBOUNCE_KEY_TIME_MS ) {
+keyDetected = matrixKeypadScan();
+matrixKeypadState = ( keyDetected == matrixKeypadLastKeyPressed )
+? MATRIX_KEYPAD_KEY_HOLD_PRESSED : MATRIX_KEYPAD_SCANNING;
+}
+accumulatedDebounceMatrixKeypadTime += TIME_INCREMENT_MS;
+break;
+case MATRIX_KEYPAD_KEY_HOLD_PRESSED:
+keyDetected = matrixKeypadScan();
+if ( keyDetected != matrixKeypadLastKeyPressed ) {
+if ( keyDetected == &#39;\0&#39; ) keyReleased = matrixKeypadLastKeyPressed;
+matrixKeypadState = MATRIX_KEYPAD_SCANNING;
+}
+break;
+
+default:
+matrixKeypadInit();
+break;
+}
+return keyReleased;
+}
+
+motorDirection_t motorDirectionRead() { return motorDirection; }
+
+void motorDirectionWrite( motorDirection_t direction )
+{
+motorDirection = direction;
+}
+
+const char* motorStateToStr( motorDirection_t state )
+{
+if ( state == DIRECTION_1 ) return &quot;OPENING&quot;;
+if ( state == DIRECTION_2 ) return &quot;CLOSING&quot;;
+return &quot;STOPPED&quot;;
+}
+
+void serialPrint( const char* message )
+{
+uartUsb.write( message, strlen(message) );
+}
